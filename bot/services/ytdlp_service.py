@@ -6,6 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception as e:
+    pass
+
 import yt_dlp
 
 from bot.config import DOWNLOADS_DIR, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, BASE_DIR
@@ -32,10 +38,10 @@ class DownloaderService:
         self.download_dir = DOWNLOADS_DIR
         self.cookies_file = BASE_DIR / "cookies.txt"
 
-    def _get_ydl_options(self, output_template: str) -> Dict[str, Any]:
-        """yt-dlp uchun optimal va blokirovkalarni aylanib o'tuvchi sozlamalar."""
+    def _get_ydl_options(self, output_template: str, client: str = "android") -> Dict[str, Any]:
+        """yt-dlp uchun optimal sozlamalar."""
         opts = {
-            'format': 'best[ext=mp4][filesize<?50M]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'best[ext=mp4][filesize<?50M]/bestvideo[ext=mp4][filesize<?50M]+bestaudio[ext=m4a]/best[filesize<?50M]/best',
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
@@ -43,10 +49,10 @@ class DownloaderService:
             'max_filesize': MAX_FILE_SIZE_BYTES,
             'socket_timeout': 30,
             'geo_bypass': True,
-            # YouTube bot-check va 'Sign in' cheklovlarini aylanib o'tish uchun mijozlar
+            # YouTube bot-check va 'Sign in' cheklovlarisiz toza Android mijozi
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'web_creator', 'mweb', 'web'],
+                    'player_client': [client],
                 }
             },
             'http_headers': {
@@ -59,141 +65,112 @@ class DownloaderService:
             },
         }
 
-        # Agar cookies.txt mavjud bo'lsa, avtomatik ulaymiz
+        # Agar cookies.txt mavjud bo'lsa
         if self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
             opts['cookiefile'] = str(self.cookies_file)
-            logger.info("cookies.txt fayli yuklandi va foydalanilmoqda.")
 
         return opts
-
-    def _sync_extract_info(self, url: str) -> Optional[Dict[str, Any]]:
-        """Video haqida metama'lumotlarni yuklab olmasdan olish."""
-        opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'socket_timeout': 15,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'web_creator', 'mweb', 'web'],
-                }
-            },
-        }
-        if self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
-            opts['cookiefile'] = str(self.cookies_file)
-
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        except Exception as e:
-            logger.error("Metama'lumot olishda xatolik: %s", e)
-            return None
 
     def _sync_download(self, url: str) -> DownloadResult:
         """Videoni diskka yuklab olish (sinxron rejimda)."""
         unique_id = str(uuid.uuid4())[:8]
         outtmpl = str(self.download_dir / f"video_{unique_id}_%(id)s.%(ext)s")
-        ydl_opts = self._get_ydl_options(outtmpl)
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    return DownloadResult(
-                        success=False,
-                        error_message="Video haqida ma'lumot topilmadi yoki havola noto'g'ri."
-                    )
+        # YouTube uchun avval android mijozini sinab ko'ramiz
+        clients_to_try = ["android", "android_creator", "web"]
+        last_error = None
 
-                # Agar playlist/entries bo'lsa, birinchi elementni olamiz
-                if 'entries' in info and info['entries']:
-                    info = info['entries'][0]
+        for client in clients_to_try:
+            ydl_opts = self._get_ydl_options(outtmpl, client=client)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if not info:
+                        continue
 
-                # Yuklangan fayl nomini aniqlash
-                filename = ydl.prepare_filename(info)
-                file_path = Path(filename)
+                    # Agar playlist/entries bo'lsa, birinchi elementni olamiz
+                    if 'entries' in info and info['entries']:
+                        info = info['entries'][0]
 
-                # Ba'zida kengaytma o'zgarishi mumkin (.mkv -> .mp4)
-                if not file_path.exists():
-                    matching_files = list(self.download_dir.glob(f"video_{unique_id}_*"))
-                    if matching_files:
-                        file_path = matching_files[0]
-                    else:
+                    # Yuklangan fayl nomini aniqlash
+                    filename = ydl.prepare_filename(info)
+                    file_path = Path(filename)
+
+                    # Agar kengaytma o'zgargan bo'lsa (.mkv / .webm -> .mp4)
+                    if not file_path.exists():
+                        matching_files = list(self.download_dir.glob(f"video_{unique_id}_*"))
+                        if matching_files:
+                            file_path = matching_files[0]
+                        else:
+                            continue
+
+                    file_size = file_path.stat().st_size
+
+                    # Hajm 50MB dan katta bo'lsa
+                    if file_size > MAX_FILE_SIZE_BYTES:
                         return DownloadResult(
                             success=False,
-                            error_message="Yuklangan video fayli diskda topilmadi."
+                            file_path=file_path,
+                            file_size=file_size,
+                            error_message=(
+                                f"⚠️ Video hajmi {format_size(file_size)} ekan.\n"
+                                f"Telegram botlari orqali faqat {MAX_FILE_SIZE_MB} MB gacha bo'lgan "
+                                f"videolarni yuborish mumkin."
+                            )
                         )
 
-                file_size = file_path.stat().st_size
+                    title = info.get('title') or "Video"
+                    duration = info.get('duration')
+                    width = info.get('width')
+                    height = info.get('height')
+                    thumbnail_url = info.get('thumbnail')
 
-                # Hajm 50MB dan katta bo'lsa
-                if file_size > MAX_FILE_SIZE_BYTES:
                     return DownloadResult(
-                        success=False,
+                        success=True,
+                        title=title,
                         file_path=file_path,
-                        file_size=file_size,
-                        error_message=(
-                            f"⚠️ Video hajmi {format_size(file_size)} ekan.\n"
-                            f"Telegram botlari orqali faqat {MAX_FILE_SIZE_MB} MB gacha bo'lgan "
-                            f"videolarni yuborish mumkin."
-                        )
+                        thumbnail_url=thumbnail_url,
+                        duration=duration,
+                        width=width,
+                        height=height,
+                        file_size=file_size
                     )
 
-                title = info.get('title') or "Video"
-                duration = info.get('duration')
-                width = info.get('width')
-                height = info.get('height')
-                thumbnail_url = info.get('thumbnail')
+            except yt_dlp.utils.MaxDownloadsReached:
+                return DownloadResult(success=False, error_message="Yuklashlar limiti oshib ketdi.")
+            except yt_dlp.utils.DownloadError as e:
+                last_error = e
+                error_str = str(e).lower()
+                if "file is larger than max-filesize" in error_str or "max_filesize" in error_str:
+                    return DownloadResult(
+                        success=False,
+                        error_message=f"⚠️ Video hajmi {MAX_FILE_SIZE_MB} MB dan katta. Telegram cheklovi tufayli yuklab bo'lmaydi."
+                    )
+                # Keyingi clientga o'tish
+                continue
+            except Exception as e:
+                last_error = e
+                logger.error("Client %s xatolik berdi: %s", client, e)
+                continue
 
-                return DownloadResult(
-                    success=True,
-                    title=title,
-                    file_path=file_path,
-                    thumbnail_url=thumbnail_url,
-                    duration=duration,
-                    width=width,
-                    height=height,
-                    file_size=file_size
-                )
-
-        except yt_dlp.utils.MaxDownloadsReached:
-            return DownloadResult(success=False, error_message="Yuklashlar limiti oshib ketdi.")
-        except yt_dlp.utils.DownloadError as e:
-            error_str = str(e).lower()
-            if "file is larger than max-filesize" in error_str or "max_filesize" in error_str:
-                return DownloadResult(
-                    success=False,
-                    error_message=f"⚠️ Video hajmi {MAX_FILE_SIZE_MB} MB dan katta. Telegram cheklovi tufayli yuklab bo'lmaydi."
-                )
-            elif "private" in error_str:
-                return DownloadResult(
-                    success=False,
-                    error_message="🔒 Bu video yopiq (shaxsiy) hisobda joylashgan yoki maxfiy."
-                )
+        # Agar barcha clientlar urinishidan so'ng ham yuklanmasa
+        if last_error:
+            error_str = str(last_error).lower()
+            if "private" in error_str:
+                return DownloadResult(success=False, error_message="🔒 Bu video yopiq (shaxsiy) hisobda joylashgan yoki maxfiy.")
             elif "sign in" in error_str or "login" in error_str:
                 return DownloadResult(
                     success=False,
                     error_message=(
-                        "🔒 Ushbu video yosh cheklovi (18+) yoki YouTube himoyasi sababli akkauntga kirishni talab qilmoqda.\n\n"
-                        "💡 <i>Oddiy ommaviy videolarni bemalol yuklab olishingiz mumkin.</i>"
+                        "🔒 Ushbu video yosh cheklovi (18+) yoki maxfiyligi sababli akkauntga kirishni talab qilmoqda."
                     )
                 )
-            else:
-                logger.error("yt-dlp DownloadError: %s", e)
-                return DownloadResult(
-                    success=False,
-                    error_message="❌ Videoni yuklab bo'lmadi. Havola to'g'riligini yoki video mavjudligini tekshiring."
-                )
-        except Exception as e:
-            logger.exception("Kutilmagan xatolik: %s", e)
-            return DownloadResult(
-                success=False,
-                error_message=f"❌ Xatolik yuz berdi: {str(e)[:100]}"
-            )
+
+        return DownloadResult(
+            success=False,
+            error_message="❌ Videoni yuklab bo'lmadi. Havola to'g'riligini yoki video mavjudligini tekshiring."
+        )
 
     async def download_video(self, url: str) -> DownloadResult:
         """Asinxron tarzda videoni yuklab olish."""
         return await asyncio.to_thread(self._sync_download, url)
-
-    async def get_info(self, url: str) -> Optional[Dict[str, Any]]:
-        """Asinxron tarzda video metama'lumotlarini olish."""
-        return await asyncio.to_thread(self._sync_extract_info, url)
