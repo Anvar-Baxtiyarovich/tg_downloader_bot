@@ -6,6 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+# MUHIM: config birinchi import qilinadi — u Deno PATH'ini sozlaydi
+from bot.config import DOWNLOADS_DIR, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, BASE_DIR
+
 try:
     import static_ffmpeg
     static_ffmpeg.add_paths()
@@ -14,7 +17,6 @@ except Exception:
 
 import yt_dlp
 
-from bot.config import DOWNLOADS_DIR, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, BASE_DIR
 from bot.utils.helpers import format_size, compress_video, cleanup_file
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,7 @@ class DownloaderService:
 
         # --- 1-BOSQICH: Cookiessiz tezkor Android yuklovchi ---
         opts_android = self._base_options(output_template)
+        opts_android['remote_components'] = ['ejs:github']
         opts_android['extractor_args'] = {
             'youtube': {
                 'player_client': ['android'],
@@ -87,12 +90,17 @@ class DownloaderService:
         }
         strategies.append(("android (cookiessiz)", opts_android))
 
-        # --- 2-BOSQICH: Cookies + EJS challenge solver ---
-        opts_web_cookies = self._base_options(output_template)
-        opts_web_cookies['remote_components'] = ['ejs:github']
+        # --- 2-BOSQICH: Cookies + EJS challenge solver (18+ uchun) ---
         if self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
+            opts_web_cookies = self._base_options(output_template)
+            opts_web_cookies['remote_components'] = ['ejs:github']
             opts_web_cookies['cookiefile'] = str(self.cookies_file)
-        strategies.append(("web (cookies + ejs:github)", opts_web_cookies))
+            strategies.append(("web (cookies + ejs:github)", opts_web_cookies))
+
+        # --- 3-BOSQICH: Cookiessiz web + EJS (zaxira) ---
+        opts_web_noauth = self._base_options(output_template)
+        opts_web_noauth['remote_components'] = ['ejs:github']
+        strategies.append(("web (cookiessiz + ejs:github)", opts_web_noauth))
 
         return strategies
 
