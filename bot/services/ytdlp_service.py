@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any
 
 import yt_dlp
 
-from bot.config import DOWNLOADS_DIR, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
+from bot.config import DOWNLOADS_DIR, MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, BASE_DIR
 from bot.utils.helpers import format_size
 
 logger = logging.getLogger(__name__)
@@ -30,10 +30,11 @@ class DownloadResult:
 class DownloaderService:
     def __init__(self):
         self.download_dir = DOWNLOADS_DIR
+        self.cookies_file = BASE_DIR / "cookies.txt"
 
     def _get_ydl_options(self, output_template: str) -> Dict[str, Any]:
-        """yt-dlp uchun optimal sozlamalar."""
-        return {
+        """yt-dlp uchun optimal va blokirovkalarni aylanib o'tuvchi sozlamalar."""
+        opts = {
             'format': 'best[ext=mp4][filesize<?50M]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
             'outtmpl': output_template,
             'quiet': True,
@@ -42,16 +43,28 @@ class DownloaderService:
             'max_filesize': MAX_FILE_SIZE_BYTES,
             'socket_timeout': 30,
             'geo_bypass': True,
-            # Instagram va YouTube uchun user-agent
+            # YouTube bot-check va 'Sign in' cheklovlarini aylanib o'tish uchun mijozlar
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web_creator', 'mweb', 'web'],
+                }
+            },
             'http_headers': {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/122.0.0.0 Safari/537.36'
+                    'Chrome/124.0.0.0 Safari/537.36'
                 ),
                 'Accept-Language': 'en-US,en;q=0.9',
             },
         }
+
+        # Agar cookies.txt mavjud bo'lsa, avtomatik ulaymiz
+        if self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
+            opts['cookiefile'] = str(self.cookies_file)
+            logger.info("cookies.txt fayli yuklandi va foydalanilmoqda.")
+
+        return opts
 
     def _sync_extract_info(self, url: str) -> Optional[Dict[str, Any]]:
         """Video haqida metama'lumotlarni yuklab olmasdan olish."""
@@ -60,7 +73,15 @@ class DownloaderService:
             'no_warnings': True,
             'noplaylist': True,
             'socket_timeout': 15,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web_creator', 'mweb', 'web'],
+                }
+            },
         }
+        if self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
+            opts['cookiefile'] = str(self.cookies_file)
+
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -93,7 +114,6 @@ class DownloaderService:
 
                 # Ba'zida kengaytma o'zgarishi mumkin (.mkv -> .mp4)
                 if not file_path.exists():
-                    # Eng so'nggi yuklangan mos faylni qidiramiz
                     matching_files = list(self.download_dir.glob(f"video_{unique_id}_*"))
                     if matching_files:
                         file_path = matching_files[0]
@@ -152,7 +172,10 @@ class DownloaderService:
             elif "sign in" in error_str or "login" in error_str:
                 return DownloadResult(
                     success=False,
-                    error_message="🔒 Ushbu videoni ko'rish uchun akkauntga kirish talab etiladi."
+                    error_message=(
+                        "🔒 Ushbu video yosh cheklovi (18+) yoki YouTube himoyasi sababli akkauntga kirishni talab qilmoqda.\n\n"
+                        "💡 <i>Oddiy ommaviy videolarni bemalol yuklab olishingiz mumkin.</i>"
+                    )
                 )
             else:
                 logger.error("yt-dlp DownloadError: %s", e)
@@ -168,7 +191,7 @@ class DownloaderService:
             )
 
     async def download_video(self, url: str) -> DownloadResult:
-        """Asinxron tarzda videoni yuklab olish (boshqa foydalanuvchilarni to'xtatib qo'ymaslik uchun)."""
+        """Asinxron tarzda videoni yuklab olish."""
         return await asyncio.to_thread(self._sync_download, url)
 
     async def get_info(self, url: str) -> Optional[Dict[str, Any]]:
