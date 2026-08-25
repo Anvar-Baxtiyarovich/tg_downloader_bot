@@ -43,7 +43,7 @@ class DownloaderService:
         if raw_cookies and not self.cookies_file.exists():
             try:
                 self.cookies_file.write_text(raw_cookies, encoding="utf-8")
-                logger.info(".env dagi YOUTUBE_COOKIES faylga saqlandi.")
+                logger.info(".env dagi YOUTUBE_COOKIES cookies.txt fayliga saqlandi.")
             except Exception as e:
                 logger.warning("YOUTUBE_COOKIES ni yozishda xatolik: %s", e)
 
@@ -57,6 +57,8 @@ class DownloaderService:
             'noplaylist': True,
             'socket_timeout': 30,
             'geo_bypass': True,
+            # YouTube JS challenge va n-sig masofaviy yechuvchi
+            'remote_components': ['ejs:github'],
             'postprocessors': [{
                 'key': 'FFmpegVideoConvertor',
                 'preferedformat': 'mp4',
@@ -86,7 +88,6 @@ class DownloaderService:
 
         # Birinchi urinish: standart options
         attempts = [None]
-        # Agar cookies.txt bo'lmasa, Windows brauzerlaridan cookies olishga urinish
         if not (self.cookies_file.exists() and self.cookies_file.stat().st_size > 0):
             attempts.extend(["chrome", "edge", "firefox", "brave"])
 
@@ -169,7 +170,6 @@ class DownloaderService:
 
             except yt_dlp.utils.DownloadError as e:
                 last_error = e
-                # Agar oddiy urinish xato bersa, keyingi brauzer cookie urinishiga o'tamiz
                 continue
             except Exception as e:
                 last_error = e
@@ -184,8 +184,7 @@ class DownloaderService:
                     success=False,
                     error_message=(
                         "🔞 <b>Ushbu video yosh cheklovi (18+) ostida!</b>\n\n"
-                        "YouTube 18+ videolarni faqat balog'at yoshiga yetgan Google akkauntlar orqali ko'rishga ruxsat beradi.\n\n"
-                        "💡 <i>Bunday videolarni yuklash uchun botga bir martalik <code>cookies.txt</code> faylini joylash zarur.</i>"
+                        "YouTube 18+ videolarni faqat balog'at yoshiga yetgan Google akkauntlar orqali ko'rishga ruxsat beradi."
                     )
                 )
 
