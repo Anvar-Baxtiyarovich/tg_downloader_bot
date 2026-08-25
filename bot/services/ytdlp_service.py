@@ -4,7 +4,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 try:
     import static_ffmpeg
@@ -38,10 +38,18 @@ class DownloaderService:
         self.download_dir = DOWNLOADS_DIR
         self.cookies_file = BASE_DIR / "cookies.txt"
 
-    def _get_ydl_options(self, output_template: str, client: str = "android") -> Dict[str, Any]:
-        """yt-dlp uchun optimal sozlamalar."""
+    def _get_ydl_options(
+        self,
+        output_template: str,
+        client: str = "android",
+        player_skip: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """yt-dlp uchun har qanday holatda yuklay oladigan universal sozlamalar."""
+        if player_skip is None:
+            player_skip = ['webpage', 'configs']
+
         opts = {
-            'format': 'best[ext=mp4][filesize<?50M]/bestvideo[ext=mp4][filesize<?50M]+bestaudio[ext=m4a]/best[filesize<?50M]/best',
+            'format': 'best[ext=mp4][filesize<?50M]/bestvideo[ext=mp4][filesize<?50M]+bestaudio[ext=m4a]/best[filesize<?50M]/18/22/best',
             'outtmpl': output_template,
             'quiet': True,
             'no_warnings': True,
@@ -49,10 +57,10 @@ class DownloaderService:
             'max_filesize': MAX_FILE_SIZE_BYTES,
             'socket_timeout': 30,
             'geo_bypass': True,
-            # YouTube bot-check va 'Sign in' cheklovlarisiz toza Android mijozi
             'extractor_args': {
                 'youtube': {
                     'player_client': [client],
+                    'player_skip': player_skip,
                 }
             },
             'http_headers': {
@@ -65,23 +73,32 @@ class DownloaderService:
             },
         }
 
-        # Agar cookies.txt mavjud bo'lsa
+        # Agar cookies.txt fayli bo'lsa (yopiq/18+ videolar uchun)
         if self.cookies_file.exists() and self.cookies_file.stat().st_size > 0:
             opts['cookiefile'] = str(self.cookies_file)
 
         return opts
 
     def _sync_download(self, url: str) -> DownloadResult:
-        """Videoni diskka yuklab olish (sinxron rejimda)."""
+        """Videoni diskka har qanday holatda yuklab olish."""
         unique_id = str(uuid.uuid4())[:8]
         outtmpl = str(self.download_dir / f"video_{unique_id}_%(id)s.%(ext)s")
 
-        # YouTube uchun avval android mijozini sinab ko'ramiz
-        clients_to_try = ["android", "android_creator", "web"]
+        # Turli xil strategiyalar (har qanday blokirovkani aylanib o'tish uchun)
+        strategies = [
+            {"client": "android", "player_skip": ["webpage", "configs"]},
+            {"client": "android", "player_skip": []},
+            {"client": "mweb", "player_skip": []},
+            {"client": "web", "player_skip": []}
+        ]
+
         last_error = None
 
-        for client in clients_to_try:
-            ydl_opts = self._get_ydl_options(outtmpl, client=client)
+        for strategy in strategies:
+            client = strategy["client"]
+            player_skip = strategy["player_skip"]
+            ydl_opts = self._get_ydl_options(outtmpl, client=client, player_skip=player_skip)
+
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=True)
@@ -92,12 +109,20 @@ class DownloaderService:
                     if 'entries' in info and info['entries']:
                         info = info['entries'][0]
 
-                    # Yuklangan fayl nomini aniqlash
-                    filename = ydl.prepare_filename(info)
-                    file_path = Path(filename)
+                    # Aniq yuklangan fayl yo'lini topish
+                    file_path = None
+                    req_downloads = info.get('requested_downloads')
+                    if req_downloads and len(req_downloads) > 0:
+                        potential_path = req_downloads[0].get('filepath')
+                        if potential_path and Path(potential_path).exists():
+                            file_path = Path(potential_path)
 
-                    # Agar kengaytma o'zgargan bo'lsa (.mkv / .webm -> .mp4)
-                    if not file_path.exists():
+                    if not file_path:
+                        filename = ydl.prepare_filename(info)
+                        if Path(filename).exists():
+                            file_path = Path(filename)
+
+                    if not file_path or not file_path.exists():
                         matching_files = list(self.download_dir.glob(f"video_{unique_id}_*"))
                         if matching_files:
                             file_path = matching_files[0]
@@ -125,6 +150,8 @@ class DownloaderService:
                     height = info.get('height')
                     thumbnail_url = info.get('thumbnail')
 
+                    logger.info("Video muvaffaqiyatli yuklandi: %s (client: %s)", title, client)
+
                     return DownloadResult(
                         success=True,
                         title=title,
@@ -146,14 +173,13 @@ class DownloaderService:
                         success=False,
                         error_message=f"⚠️ Video hajmi {MAX_FILE_SIZE_MB} MB dan katta. Telegram cheklovi tufayli yuklab bo'lmaydi."
                     )
-                # Keyingi clientga o'tish
+                logger.warning("Strategy (client: %s) muvaffaqiyatsiz bo'ldi, keyingi strategiyaga o'tilmoqda: %s", client, e)
                 continue
             except Exception as e:
                 last_error = e
-                logger.error("Client %s xatolik berdi: %s", client, e)
+                logger.warning("Strategy (client: %s) kutilmagan xato: %s", client, e)
                 continue
 
-        # Agar barcha clientlar urinishidan so'ng ham yuklanmasa
         if last_error:
             error_str = str(last_error).lower()
             if "private" in error_str:
