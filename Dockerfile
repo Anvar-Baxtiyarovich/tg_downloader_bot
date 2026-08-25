@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
-# Kerakli tizim paketlari va ffmpeg ni o'rnatish
+# Kerakli tizim paketlari: ffmpeg va nodejs (YouTube JS challenge solver uchun)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     curl \
     && rm -rf /var/lib/apt/lists/*
 

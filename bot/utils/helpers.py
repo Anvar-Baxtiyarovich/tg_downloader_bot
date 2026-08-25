@@ -1,6 +1,8 @@
 import re
 import os
 import logging
+import subprocess
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -55,3 +57,42 @@ def cleanup_file(file_path: Optional[Path]) -> None:
             logger.info("Vaqtinchalik fayl tozalandi: %s", file_path)
     except Exception as e:
         logger.warning("Faylni o'chirishda xatolik yuz berdi: %s, xato: %s", file_path, e)
+
+
+def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 45, duration: Optional[int] = None) -> bool:
+    """Agar video hajmi 50MB dan katta bo'lsa, ffmpeg yordamida Telegram limitiga moslab siqadi."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        logger.warning("ffmpeg topilmadi, videoni siqib bo'lmaydi.")
+        return False
+
+    if not duration or duration <= 0:
+        duration = 300  # Default 5 daqiqa deb hisoblaymiz
+
+    # Target bitrate hisoblash
+    total_bits = target_size_mb * 1024 * 1024 * 8
+    target_bitrate_bps = (total_bits / duration) - (96 * 1000)
+    video_bitrate_kbps = max(int(target_bitrate_bps / 1000), 200)
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-b:v", f"{video_bitrate_kbps}k",
+        "-maxrate", f"{int(video_bitrate_kbps * 1.4)}k",
+        "-bufsize", f"{int(video_bitrate_kbps * 2)}k",
+        "-vf", "scale=-2:'min(720,ih)'",
+        "-preset", "veryfast",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        str(output_path)
+    ]
+
+    try:
+        logger.info("Video siqilmoqda: %s (target: %skbps)", input_path, video_bitrate_kbps)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=120)
+        return output_path.exists() and output_path.stat().st_size <= (50 * 1024 * 1024)
+    except Exception as e:
+        logger.warning("Videoni siqishda xatolik: %s", e)
+        return False

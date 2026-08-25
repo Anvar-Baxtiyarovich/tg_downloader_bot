@@ -1,10 +1,17 @@
 import os
+import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
 # .env faylini yuklash
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
+
+# Deno va Node JS yo'llarini PATH ga qo'shish (Windows va Linux uchun)
+user_home = Path.home()
+deno_bin = user_home / ".deno" / "bin"
+if deno_bin.exists():
+    os.environ["PATH"] = str(deno_bin) + os.pathsep + os.environ.get("PATH", "")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
