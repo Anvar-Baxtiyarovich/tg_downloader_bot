@@ -1,0 +1,9 @@
+services:
+  downloader-bot:
+    build: .
+    container_name: tg_downloader_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
