@@ -59,7 +59,7 @@ def cleanup_file(file_path: Optional[Path]) -> None:
         logger.warning("Faylni o'chirishda xatolik yuz berdi: %s, xato: %s", file_path, e)
 
 
-def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 45, duration: Optional[int] = None) -> bool:
+def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 44, duration: Optional[int] = None) -> bool:
     """Agar video hajmi 50MB dan katta bo'lsa, ffmpeg yordamida Telegram limitiga moslab siqadi."""
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
@@ -69,10 +69,11 @@ def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 45
     if not duration or duration <= 0:
         duration = 300  # Default 5 daqiqa deb hisoblaymiz
 
-    # Target bitrate hisoblash
+    # Target bitrate hisoblash (xavfsiz maqsad: 44 MB)
     total_bits = target_size_mb * 1024 * 1024 * 8
-    target_bitrate_bps = (total_bits / duration) - (96 * 1000)
-    video_bitrate_kbps = max(int(target_bitrate_bps / 1000), 200)
+    audio_bitrate_kbps = 64 if duration > 600 else 96
+    target_video_bps = (total_bits / duration) - (audio_bitrate_kbps * 1000)
+    video_bitrate_kbps = max(int(target_video_bps / 1000), 50)
 
     cmd = [
         ffmpeg_bin,
@@ -80,12 +81,12 @@ def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 45
         "-i", str(input_path),
         "-c:v", "libx264",
         "-b:v", f"{video_bitrate_kbps}k",
-        "-maxrate", f"{int(video_bitrate_kbps * 1.4)}k",
-        "-bufsize", f"{int(video_bitrate_kbps * 2)}k",
+        "-maxrate", f"{int(video_bitrate_kbps * 1.2)}k",
+        "-bufsize", f"{int(video_bitrate_kbps * 1.5)}k",
         "-vf", "scale=-2:'min(720,ih)'",
         "-preset", "veryfast",
         "-c:a", "aac",
-        "-b:a", "96k",
+        "-b:a", f"{audio_bitrate_kbps}k",
         str(output_path)
     ]
 
