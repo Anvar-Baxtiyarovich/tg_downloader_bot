@@ -1,4 +1,5 @@
 import asyncio
+import http.cookiejar
 import logging
 import os
 import re
@@ -67,10 +68,10 @@ class DownloaderService:
         """Umumiy sozlamalar (barcha strategiyalar uchun)."""
         return {
             'format': (
-                'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
-                'best[height<=720][ext=mp4]/'
-                'bestvideo[height<=720]+bestaudio/'
-                'best[height<=720]/best'
+                'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                'best[height<=1080][ext=mp4]/'
+                'bestvideo[height<=1080]+bestaudio/'
+                'best[height<=1080]/best'
             ),
             'outtmpl': output_template,
             'quiet': True,
@@ -152,6 +153,40 @@ class DownloaderService:
     def _is_instagram_url(self, url: str) -> bool:
         """Havola Instagram tarmog'iga tegishli ekanligini tekshirish."""
         return bool(re.search(r'https?://(?:www\.)?instagram\.com/', url, re.IGNORECASE))
+
+    def _is_bilibili_url(self, url: str) -> bool:
+        """Havola Bilibili tarmog'iga tegishli ekanligini tekshirish."""
+        return bool(re.search(r'https?://(?:www\.)?(?:bilibili\.com|b23\.tv)/', url, re.IGNORECASE))
+
+    def _is_tiktok_url(self, url: str) -> bool:
+        """Havola TikTok tarmog'iga tegishli ekanligini tekshirish."""
+        return bool(re.search(r'https?://(?:www\.|(?:vm|vt)\.)?tiktok\.com/', url, re.IGNORECASE))
+
+    def _is_wechat_channels_url(self, url: str) -> bool:
+        """Havola WeChat Channels (视频号) tarmog'iga tegishli ekanligini tekshirish."""
+        return bool(re.search(r'channels\.weixin\.qq\.com|weixin\.qq\.com/sph', url, re.IGNORECASE))
+
+    def _get_bilibili_cookies(self) -> List[Any]:
+        """Bilibili WAF 412 xatosini aylanib o'tish uchun buvid3 va b_nut cookie-larini avtomatik olish."""
+        try:
+            cj = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            req = urllib.request.Request(
+                'https://www.bilibili.com/',
+                headers={
+                    'User-Agent': (
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/124.0.0.0 Safari/537.36'
+                    ),
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+            )
+            opener.open(req, timeout=8)
+            return list(cj)
+        except Exception as e:
+            logger.warning("Bilibili cookie-larini olishda xatolik: %s", e)
+            return []
 
     def _download_http_file(self, url: str, dest_path: Path, referer: Optional[str] = None) -> bool:
         """HTTP orqali faylni bevosita oqim (stream) tarzida xavfsiz yuklab olish."""
@@ -345,7 +380,7 @@ class DownloaderService:
             logger.warning("Instagram yuklash maxsus metodi xatolik berdi: %s. Zaxira usulga o'tilmoqda...", e)
             return None
 
-    def _sync_download(self, url: str) -> DownloadResult:
+    def _sync_download(self, url: str, extra_cookies: Optional[List[Any]] = None, referer: Optional[str] = None) -> DownloadResult:
         """Videoni ikki bosqichli strategiya bilan yuklab olish."""
         unique_id = str(uuid.uuid4())[:8]
         outtmpl = str(self.download_dir / f"video_{unique_id}_%(id)s.%(ext)s")
@@ -355,8 +390,17 @@ class DownloaderService:
 
         for name, ydl_opts in strategies:
             try:
+                # Agar maxsus Referer sarlavhasi berilgan bo'lsa (masalan, Bilibili yoki TikTok uchun)
+                if referer:
+                    ydl_opts.setdefault('http_headers', {})['Referer'] = referer
+
                 logger.info("Yuklash urinishi: %s", name)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Agar dinamik cookie-lar (masalan, Bilibili buvid3/b_nut) berilgan bo'lsa
+                    if extra_cookies:
+                        for c in extra_cookies:
+                            ydl.cookiejar.set_cookie(c)
+
                     info = ydl.extract_info(url, download=True)
                     if not info:
                         continue
@@ -427,7 +471,19 @@ class DownloaderService:
         )
 
     def _sync_process(self, url: str) -> DownloadResult:
-        """Havolani tahlil qilib, Instagram yoki boshqa platformalar uchun mos usulda yuklash."""
+        """Havolani tahlil qilib, mos platforma strategiyasi orqali yuklash."""
+        # 1. WeChat Channels tekshiruvi (Tencent DRM / faqat ilova ichidagi cheklov)
+        if self._is_wechat_channels_url(url):
+            return DownloadResult(
+                success=False,
+                error_message=(
+                    "⚠️ <b>WeChat Channels (视频号) qo'llab-quvvatlanmaydi.</b>\n\n"
+                    "WeChat video kanallari Tencent tomonidan faqat WeChat mobil ilovasi ichida "
+                    "shifrlangan (DRM) ko'rinishda ochiladi va ularni to'g'ridan-to'g'ri ochiq havola orqali yuklab bo'lmaydi."
+                )
+            )
+
+        # 2. Instagram (rasmlar, karusellar va videolar)
         if self._is_instagram_url(url):
             logger.info("Instagram havolasi aniqlandi, maxsus yuklovchi ishga tushirilmoqda: %s", url)
             ig_result = self._download_instagram(url)
@@ -436,6 +492,18 @@ class DownloaderService:
                 return ig_result
             logger.info("Instagram maxsus yuklovchi natija bermadi, umumiy usulga urinilmoqda...")
 
+        # 3. Bilibili (WAF 412 aylanib o'tish: buvid3/b_nut cookies bilan)
+        if self._is_bilibili_url(url):
+            logger.info("Bilibili havolasi aniqlandi, buvid cookie-lari olinmoqda: %s", url)
+            bili_cookies = self._get_bilibili_cookies()
+            return self._sync_download(url, extra_cookies=bili_cookies, referer="https://www.bilibili.com/")
+
+        # 4. TikTok (Suv belgisiz video yuklash)
+        if self._is_tiktok_url(url):
+            logger.info("TikTok havolasi aniqlandi: %s", url)
+            return self._sync_download(url, referer="https://www.tiktok.com/")
+
+        # 5. Boshqa barcha platformalar (YouTube, Pinterest va b.)
         return self._sync_download(url)
 
     async def download_video(self, url: str) -> DownloadResult:

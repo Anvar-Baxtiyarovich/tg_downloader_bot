@@ -16,7 +16,9 @@ async def cmd_start(message: types.Message):
         f"📌 <b>Qo'llab-quvvatlanadigan platformalar:</b>\n"
         f"• <b>Instagram</b> (Reels, Rasmlar, Karusel/Albom postlar)\n"
         f"• <b>YouTube</b> (Shorts, Videolar)\n"
-        f"• <b>TikTok</b>, <b>Pinterest</b> va boshqalar\n\n"
+        f"• <b>TikTok</b> (Suv belgisiz original videolar)\n"
+        f"• <b>Bilibili</b> (HD videolar)\n"
+        f"• <b>Pinterest</b> va boshqalar\n\n"
         f"🚀 <i>Shunchaki media havolasini (linkini) yuboring!</i>"
     )
     await message.answer(text, parse_mode="HTML")
@@ -27,7 +29,7 @@ async def cmd_help(message: types.Message):
     """/help buyrug'i uchun javob."""
     text = (
         "📖 <b>Botdan foydalanish qo'llanmasi:</b>\n\n"
-        "1. Instagram yoki YouTube ilovasidan post yoki videoning <b>ulashish (share)</b> tugmasini bosing.\n"
+        "1. Instagram, YouTube, TikTok yoki Bilibili ilovasidan post yoki videoning <b>ulashish (share)</b> tugmasini bosing.\n"
         "2. <b>Nusxa olish (copy link)</b> qilib, havolani ushbu botga yuboring.\n"
         "3. Bot media (video, rasm yoki butun albom)ni yuklab, sizga toza holda yuboradi.\n\n"
         "ℹ️ <i>Telegram boti orqali maksimal 50 MB gacha bo'lgan videolarni yuklash mumkin.</i>\n\n"
