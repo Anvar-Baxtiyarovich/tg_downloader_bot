@@ -91,7 +91,7 @@ def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 45
 
     try:
         logger.info("Video siqilmoqda: %s (target: %skbps)", input_path, video_bitrate_kbps)
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=120)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=300)
         return output_path.exists() and output_path.stat().st_size <= (50 * 1024 * 1024)
     except Exception as e:
         logger.warning("Videoni siqishda xatolik: %s", e)

@@ -1,5 +1,6 @@
 import asyncio
 import http.cookiejar
+import json
 import logging
 import os
 import re
@@ -380,6 +381,153 @@ class DownloaderService:
             logger.warning("Instagram yuklash maxsus metodi xatolik berdi: %s. Zaxira usulga o'tilmoqda...", e)
             return None
 
+    def _download_bilibili(self, url: str) -> Optional[DownloadResult]:
+        """Bilibili videolarini WAF 412 cheklovlarisiz to'g'ridan-to'g'ri mobil/HTML5 API orqali yuklab olish."""
+        unique_id = str(uuid.uuid4())[:8]
+        try:
+            # 1. Havola qisqa bo'lsa (masalan b23.tv), uni to'liq manzilga ochib olamiz
+            resolved_url = url
+            if 'b23.tv' in url:
+                try:
+                    req_red = urllib.request.Request(
+                        url,
+                        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    )
+                    with urllib.request.urlopen(req_red, timeout=8) as resp_red:
+                        resolved_url = resp_red.geturl()
+                except Exception as e:
+                    logger.warning("b23.tv yo'naltirishini olishda xatolik: %s", e)
+
+            # 2. bvid ni ajratib olish
+            bvid_match = re.search(r'(BV[a-zA-Z0-9]+)', resolved_url, re.IGNORECASE)
+            if not bvid_match:
+                logger.warning("Bilibili BVID topilmadi: %s", resolved_url)
+                return None
+            bvid = bvid_match.group(1)
+
+            # 3. m.bilibili.com orqali sarlavha, muallif, poster va davomiylikni olish (412 bermaydi)
+            title = f"Bilibili Video ({bvid})"
+            caption = None
+            thumbnail = None
+            duration = None
+            try:
+                m_req = urllib.request.Request(
+                    f"https://m.bilibili.com/video/{bvid}",
+                    headers={
+                        'User-Agent': (
+                            'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) '
+                            'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+                        ),
+                        'Referer': 'https://m.bilibili.com/',
+                    }
+                )
+                with urllib.request.urlopen(m_req, timeout=10) as m_resp:
+                    html = m_resp.read().decode('utf-8', errors='ignore')
+                    title_m = re.search(r'property="og:title" content="(.*?)"', html)
+                    if title_m:
+                        title = title_m.group(1).strip()
+                    desc_m = re.search(r'property="og:description" content="(.*?)"', html)
+                    if desc_m:
+                        caption = desc_m.group(1).strip()
+                    img_m = re.search(r'property="og:image" content="(.*?)"', html)
+                    if img_m:
+                        thumbnail = img_m.group(1).strip()
+                    dur_m = re.search(r'property="video:duration" content="(\d+)"', html)
+                    if dur_m:
+                        duration = int(dur_m.group(1))
+            except Exception as e:
+                logger.warning("m.bilibili.com metadatalarini olishda xatolik: %s", e)
+
+            # 4. cid ni pagelist API orqali olish
+            cid = None
+            p_req = urllib.request.Request(
+                f"https://api.bilibili.com/x/player/pagelist?bvid={bvid}",
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': 'https://www.bilibili.com/',
+                }
+            )
+            with urllib.request.urlopen(p_req, timeout=10) as p_resp:
+                p_data = json.loads(p_resp.read().decode())
+                if p_data.get('code') == 0 and p_data.get('data'):
+                    cid = p_data['data'][0].get('cid')
+                    if not duration and p_data['data'][0].get('duration'):
+                        duration = p_data['data'][0].get('duration')
+                    part_title = p_data['data'][0].get('part')
+                    if part_title and title.startswith("Bilibili Video"):
+                        title = part_title
+
+            if not cid:
+                logger.warning("Bilibili cid topilmadi: %s", bvid)
+                return None
+
+            # 5. playurl API orqali MP4 oqim havolasini olish (qn=64 yoki qn=32)
+            video_stream_url = None
+            for qn in [64, 32]:
+                play_url = f"https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&qn={qn}&type=&otype=json&platform=html5"
+                play_req = urllib.request.Request(
+                    play_url,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Referer': 'https://www.bilibili.com/',
+                    }
+                )
+                with urllib.request.urlopen(play_req, timeout=10) as play_resp:
+                    play_data = json.loads(play_resp.read().decode())
+                    if play_data.get('code') == 0 and play_data.get('data', {}).get('durl'):
+                        durl = play_data['data']['durl'][0]
+                        video_stream_url = durl.get('url')
+                        stream_size = durl.get('size', 0)
+                        if stream_size <= MAX_FILE_SIZE_BYTES:
+                            break
+                        if qn == 64:
+                            continue
+                        break
+
+            if not video_stream_url:
+                logger.warning("Bilibili video stream URL topilmadi: %s", bvid)
+                return None
+
+            # 6. Videoni yuklab olish
+            dest_path = self.download_dir / f"bili_{unique_id}.mp4"
+            ok = self._download_http_file(video_stream_url, dest_path, referer="https://www.bilibili.com/")
+            if not ok or not dest_path.exists():
+                logger.warning("Bilibili video faylini yuklab bo'lmadi: %s", bvid)
+                cleanup_file(dest_path)
+                return None
+
+            file_size = dest_path.stat().st_size
+            # 7. Agar hajm 50 MB dan katta bo'lsa, siqish
+            if file_size > MAX_FILE_SIZE_BYTES:
+                logger.info("Bilibili video hajmi 50MB dan katta (%s), siqish boshlanmoqda...", format_size(file_size))
+                compressed_path = self.download_dir / f"compressed_{unique_id}.mp4"
+                compressed_ok = compress_video(dest_path, compressed_path, target_size_mb=45, duration=duration)
+                if compressed_ok:
+                    cleanup_file(dest_path)
+                    dest_path = compressed_path
+                    file_size = dest_path.stat().st_size
+                else:
+                    return DownloadResult(
+                        success=False, file_path=dest_path, file_size=file_size,
+                        error_message=f"⚠️ Video hajmi juda katta ({format_size(file_size)}). Telegram botlar uchun cheklov 50 MB."
+                    )
+
+            logger.info("Bilibili muvaffaqiyatli yuklandi: %s [%s]", title, format_size(file_size))
+            return DownloadResult(
+                success=True,
+                media_type="video",
+                title=title,
+                caption=caption or title,
+                file_path=dest_path,
+                thumbnail_url=thumbnail,
+                duration=duration,
+                file_size=file_size,
+            )
+
+        except Exception as e:
+            logger.warning("Bilibili yuklashda xatolik: %s", e)
+            return None
+
     def _sync_download(self, url: str, extra_cookies: Optional[List[Any]] = None, referer: Optional[str] = None) -> DownloadResult:
         """Videoni ikki bosqichli strategiya bilan yuklab olish."""
         unique_id = str(uuid.uuid4())[:8]
@@ -459,7 +607,7 @@ class DownloaderService:
             err = str(last_error).lower()
             if "private" in err:
                 return DownloadResult(success=False, error_message="🔒 Bu media yopiq (shaxsiy) hisobda joylashgan yoki maxfiy.")
-            if "sign in" in err or "login" in err or "age" in err:
+            if "sign in" in err or "login" in err or "age-restricted" in err or " age " in err:
                 return DownloadResult(
                     success=False,
                     error_message="🔒 Ushbu kontentni yuklab bo'lmadi. cookies.txt fayli eskirgan bo'lishi mumkin — uni yangilab, qayta urinib ko'ring."
@@ -492,9 +640,13 @@ class DownloaderService:
                 return ig_result
             logger.info("Instagram maxsus yuklovchi natija bermadi, umumiy usulga urinilmoqda...")
 
-        # 3. Bilibili (WAF 412 aylanib o'tish: buvid3/b_nut cookies bilan)
+        # 3. Bilibili (To'g'ridan-to'g'ri WAF-siz Mobile/HTML5 API, natija bermasa zaxira yt-dlp)
         if self._is_bilibili_url(url):
-            logger.info("Bilibili havolasi aniqlandi, buvid cookie-lari olinmoqda: %s", url)
+            logger.info("Bilibili havolasi aniqlandi, maxsus yuklovchi ishga tushirilmoqda: %s", url)
+            bili_result = self._download_bilibili(url)
+            if bili_result and bili_result.success:
+                return bili_result
+            logger.info("Bilibili maxsus yuklovchi natija bermadi, zaxira yt-dlp usuliga urinilmoqda...")
             bili_cookies = self._get_bilibili_cookies()
             return self._sync_download(url, extra_cookies=bili_cookies, referer="https://www.bilibili.com/")
 
