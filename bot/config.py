@@ -13,6 +13,13 @@ deno_bin = user_home / ".deno" / "bin"
 if deno_bin.exists():
     os.environ["PATH"] = str(deno_bin) + os.pathsep + os.environ.get("PATH", "")
 
+# FFmpeg yo'llarini global tizim PATH ga qo'shish
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Faqat ruxsat berilgan foydalanuvchilar (agar ko'rsatilgan bo'lsa)

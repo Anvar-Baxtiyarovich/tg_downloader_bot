@@ -1,10 +1,11 @@
 import re
 import os
+import json
 import logging
 import subprocess
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,81 @@ def cleanup_file(file_path: Optional[Path]) -> None:
         logger.warning("Faylni o'chirishda xatolik yuz berdi: %s, xato: %s", file_path, e)
 
 
+def get_video_streams_info(file_path: Path) -> Optional[Dict[str, Any]]:
+    """Video fayldagi video va audio oqimlar ma'lumotini ffprobe orqali aniqlaydi."""
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin or not file_path or not file_path.exists():
+        return None
+    cmd = [
+        ffprobe_bin,
+        "-v", "error",
+        "-show_entries", "stream=index,codec_type,codec_name",
+        "-of", "json",
+        str(file_path)
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=15)
+        data = json.loads(res.stdout)
+        streams = data.get("streams", [])
+        has_video = any(s.get("codec_type") == "video" for s in streams)
+        audio_codecs = [str(s.get("codec_name", "")).lower() for s in streams if s.get("codec_type") == "audio"]
+        return {"has_video": has_video, "has_audio": bool(audio_codecs), "audio_codecs": audio_codecs}
+    except Exception as e:
+        logger.warning("ffprobe oqimlarni aniqlashda xatolik (%s): %s", file_path.name, e)
+        return None
+
+
+def ensure_telegram_compatible_audio(file_path: Path) -> Path:
+    """
+    Video audio oqimi Telegram pleyeriga mos kelishini ta'minlaydi.
+    Agar audio Opus yoki boshqa qo'llab-quvvatlanmaydigan formatda bo'lsa,
+    videoni qayta kodlamasdan (-c:v copy), faqat audioni AAC ga o'tkazadi.
+    """
+    if not file_path or not file_path.exists():
+        return file_path
+
+    info = get_video_streams_info(file_path)
+    if not info:
+        return file_path
+
+    audio_codecs = info.get("audio_codecs", [])
+    if not audio_codecs:
+        logger.info("Faylda audio oqimi mavjud emas: %s", file_path.name)
+        return file_path
+
+    # Telegram uchun xavfsiz va to'liq qo'llab-quvvatlanadigan kodeklar (aac, mp3)
+    if all(c in ["aac", "mp3"] for c in audio_codecs):
+        return file_path
+
+    logger.info("Mos kelmaydigan audio kodek (%s) aniqlandi, AAC ga o'tkazilmoqda: %s", audio_codecs, file_path.name)
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return file_path
+
+    fixed_path = file_path.with_name(f"fixed_{file_path.name}")
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(file_path),
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(fixed_path)
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=120)
+        if fixed_path.exists() and fixed_path.stat().st_size > 0:
+            cleanup_file(file_path)
+            fixed_path.rename(file_path)
+            logger.info("Audio muvaffaqiyatli AAC ga o'tkazildi: %s", file_path.name)
+            return file_path
+    except Exception as e:
+        logger.warning("Audio kodekini AAC ga o'tkazishda xatolik: %s", e)
+        cleanup_file(fixed_path)
+
+    return file_path
+
+
 def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 44, duration: Optional[int] = None) -> bool:
     """Agar video hajmi 50MB dan katta bo'lsa, ffmpeg yordamida Telegram limitiga moslab siqadi."""
     ffmpeg_bin = shutil.which("ffmpeg")
@@ -87,6 +163,7 @@ def compress_video(input_path: Path, output_path: Path, target_size_mb: int = 44
         "-preset", "veryfast",
         "-c:a", "aac",
         "-b:a", f"{audio_bitrate_kbps}k",
+        "-movflags", "+faststart",
         str(output_path)
     ]
 

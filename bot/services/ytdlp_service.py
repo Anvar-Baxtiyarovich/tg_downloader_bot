@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -29,7 +30,13 @@ try:
 except Exception:
     pass
 
-from bot.utils.helpers import format_size, compress_video, cleanup_file
+from bot.utils.helpers import (
+    format_size,
+    compress_video,
+    cleanup_file,
+    ensure_telegram_compatible_audio,
+    get_video_streams_info,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,23 +74,28 @@ class DownloaderService:
 
     def _base_options(self, output_template: str) -> Dict[str, Any]:
         """Umumiy sozlamalar (barcha strategiyalar uchun)."""
-        return {
+        ffmpeg_bin = shutil.which("ffmpeg")
+        ffmpeg_dir = str(Path(ffmpeg_bin).parent) if ffmpeg_bin else None
+
+        opts = {
             'format': (
                 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'
+                'bestvideo+bestaudio/'
                 'best[height<=1080][ext=mp4]/'
-                'bestvideo[height<=1080]+bestaudio/'
-                'best[height<=1080]/best'
+                'best[ext=mp4]/best'
             ),
+            'format_sort': ['res:1080', 'ext:mp4:m4a', 'vcodec:h264'],
             'outtmpl': output_template,
+            'merge_output_format': 'mp4',
             'quiet': True,
             'no_warnings': True,
             'noplaylist': True,
             'socket_timeout': 30,
             'geo_bypass': True,
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
+            'postprocessor_args': {
+                'merger': ['-c:v', 'copy', '-c:a', 'aac'],
+            },
             'http_headers': {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -93,6 +105,9 @@ class DownloaderService:
                 'Accept-Language': 'en-US,en;q=0.9',
             },
         }
+        if ffmpeg_dir:
+            opts['ffmpeg_location'] = ffmpeg_dir
+        return opts
 
     def _build_strategies(self, output_template: str) -> list:
         """
@@ -134,22 +149,30 @@ class DownloaderService:
         # 1. requested_downloads dan olish
         req_downloads = info.get('requested_downloads')
         if req_downloads:
-            filepath = req_downloads[0].get('filepath')
-            if filepath and Path(filepath).exists():
-                return Path(filepath)
+            for rd in req_downloads:
+                fp = rd.get('filepath')
+                if fp and Path(fp).exists() and Path(fp).suffix.lower() != '.m4a':
+                    return Path(fp)
 
         # 2. prepare_filename dan
-        filename = ydl.prepare_filename(info)
-        p = Path(filename)
-        if p.exists():
-            return p
-        mp4 = p.with_suffix('.mp4')
-        if mp4.exists():
-            return mp4
+        try:
+            filename = ydl.prepare_filename(info)
+            p = Path(filename)
+            if p.exists():
+                return p
+            mp4 = p.with_suffix('.mp4')
+            if mp4.exists():
+                return mp4
+        except Exception:
+            pass
 
-        # 3. glob bilan qidirish
-        matches = sorted(self.download_dir.glob(f"video_{unique_id}_*"), key=lambda f: f.stat().st_mtime, reverse=True)
-        return matches[0] if matches else None
+        # 3. glob bilan qidirish (shu unique_id ga ega barcha tayyor video fayllar)
+        matches = sorted(self.download_dir.glob(f"*{unique_id}*"), key=lambda f: f.stat().st_mtime, reverse=True)
+        valid = [
+            f for f in matches
+            if f.is_file() and f.suffix.lower() not in ('.part', '.ytdl', '.tmp', '.m4a') and f.stat().st_size > 0
+        ]
+        return valid[0] if valid else None
 
     def _is_instagram_url(self, url: str) -> bool:
         """Havola Instagram tarmog'iga tegishli ekanligini tekshirish."""
@@ -212,6 +235,99 @@ class DownloaderService:
             cleanup_file(dest_path)
             return False
 
+    def _download_instagram_video(
+        self,
+        formats: List[Dict[str, Any]],
+        unique_id: str,
+        idx: Optional[int] = None,
+        duration: Optional[int] = None
+    ) -> Optional[Path]:
+        """
+        Instagram video formatlaridan ovozli videoni ishonchli yuklab olish.
+        1. DASH video va DASH audio mavjud bo'lsa, ffmpeg bilan birlashtiradi.
+        2. DASH audio bo'lmasa yoki xatolik bersa, ovozli progressiv MP4 oqimini yuklaydi.
+        """
+        suffix = f"_{idx}" if idx is not None else ""
+        target_path = self.download_dir / f"ig_video_{unique_id}{suffix}.mp4"
+        ffmpeg_bin = shutil.which("ffmpeg")
+
+        # 1. Progressiv oqimlarni ajratish (video_versions - bitta MP4 faylida video va audio birga)
+        prog_formats = [
+            f for f in formats
+            if not str(f.get('format_id', '')).startswith('dash') and f.get('url')
+        ]
+        # Ovozi borligi aniq yoki ko'rsatilmagan progressiv oqimlar
+        audible_prog = [f for f in prog_formats if f.get('acodec') != 'none']
+        candidates_prog = audible_prog if audible_prog else prog_formats
+        best_prog = max(
+            candidates_prog,
+            key=lambda f: (f.get('width') or 0) * (f.get('height') or 0)
+        ) if candidates_prog else None
+
+        # 2. DASH oqimlarni ajratish (alohida video va alohida audio)
+        dash_v_list = [
+            f for f in formats
+            if str(f.get('format_id', '')).startswith('dash') and f.get('url') and (
+                (f.get('width') or 0) > 0 or f.get('ext') == 'mp4' or f.get('vcodec') not in (None, 'none')
+            )
+        ]
+        best_dash_v = max(
+            dash_v_list,
+            key=lambda f: (f.get('width') or 0) * (f.get('height') or 0)
+        ) if dash_v_list else None
+
+        dash_a_list = [
+            f for f in formats
+            if str(f.get('format_id', '')).startswith('dash') and f.get('url') and (
+                f.get('ext') == 'm4a' or (not f.get('width') and not f.get('height')) or f.get('acodec') not in (None, 'none')
+            )
+        ]
+        best_dash_a = dash_a_list[0] if dash_a_list else None
+
+        # 3. Agar DASH video va audio mavjud bo'lsa va ffmpeg bo'lsa, birlashtirib yuklash
+        if best_dash_v and best_dash_a and ffmpeg_bin:
+            tmp_v = self.download_dir / f"tmp_v_{unique_id}{suffix}.mp4"
+            tmp_a = self.download_dir / f"tmp_a_{unique_id}{suffix}.m4a"
+            logger.info("Instagram DASH video va audio topildi, alohida yuklanib birlashtirilmoqda...")
+            if self._download_http_file(best_dash_v['url'], tmp_v) and self._download_http_file(best_dash_a['url'], tmp_a):
+                try:
+                    cmd = [
+                        ffmpeg_bin, "-y",
+                        "-i", str(tmp_v),
+                        "-i", str(tmp_a),
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-movflags", "+faststart",
+                        str(target_path)
+                    ]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=120)
+                    if target_path.exists() and target_path.stat().st_size > 0:
+                        cleanup_file(tmp_v)
+                        cleanup_file(tmp_a)
+                        target_path = ensure_telegram_compatible_audio(target_path)
+                        return target_path
+                except Exception as merge_err:
+                    logger.warning("Instagram DASH birlashtirishda xatolik: %s. Progressiv oqimga o'tilmoqda...", merge_err)
+            cleanup_file(tmp_v)
+            cleanup_file(tmp_a)
+
+        # 4. Zaxira: Progressiv MP4 oqimini yuklash (ichida audio va video birga)
+        if best_prog and best_prog.get('url'):
+            logger.info("Instagram progressiv ovozli MP4 oqimi yuklanmoqda (sifati: %sx%s)...", best_prog.get('width'), best_prog.get('height'))
+            if self._download_http_file(best_prog['url'], target_path, referer="https://www.instagram.com/"):
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    target_path = ensure_telegram_compatible_audio(target_path)
+                    return target_path
+
+        # 5. So'nggi iloj (agar faqat ovozsiz video qolgan bo'lsa)
+        if best_dash_v and best_dash_v.get('url'):
+            logger.warning("Instagram uchun faqat video oqimi topildi, audio topilmadi.")
+            if self._download_http_file(best_dash_v['url'], target_path, referer="https://www.instagram.com/"):
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    return target_path
+
+        return None
+
     def _download_instagram(self, url: str) -> Optional[DownloadResult]:
         """Instagram postlarini (yakka foto, karusel/albom yoki video) yuklab olish."""
         unique_id = str(uuid.uuid4())[:8]
@@ -258,32 +374,28 @@ class DownloaderService:
                     item_thumbs = entry.get('thumbnails') or []
 
                     if item_formats:
-                        # Video element
-                        best_format = max(
-                            item_formats,
-                            key=lambda f: (f.get('width') or 0) * (f.get('height') or 0)
-                        )
-                        v_url = best_format.get('url')
-                        if not v_url:
+                        duration = entry.get('duration')
+                        v_path = self._download_instagram_video(item_formats, unique_id, idx, duration=duration)
+                        if not v_path or not v_path.exists():
                             continue
-                        v_path = self.download_dir / f"ig_video_{unique_id}_{idx}.mp4"
-                        if self._download_http_file(v_url, v_path, referer="https://www.instagram.com/"):
-                            f_size = v_path.stat().st_size
-                            duration = entry.get('duration')
-                            if f_size > MAX_FILE_SIZE_BYTES:
-                                c_path = self.download_dir / f"compressed_{unique_id}_{idx}.mp4"
-                                if compress_video(v_path, c_path, target_size_mb=45, duration=duration):
-                                    cleanup_file(v_path)
-                                    v_path = c_path
-                                    f_size = v_path.stat().st_size
-                            items.append(MediaItem(
-                                media_type="video",
-                                file_path=v_path,
-                                duration=duration,
-                                width=best_format.get('width'),
-                                height=best_format.get('height'),
-                                file_size=f_size
-                            ))
+
+                        f_size = v_path.stat().st_size
+                        if f_size > MAX_FILE_SIZE_BYTES:
+                            c_path = self.download_dir / f"compressed_{unique_id}_{idx}.mp4"
+                            if compress_video(v_path, c_path, target_size_mb=44, duration=duration):
+                                cleanup_file(v_path)
+                                v_path = c_path
+                                f_size = v_path.stat().st_size
+
+                        items.append(MediaItem(
+                            media_type="video",
+                            file_path=v_path,
+                            duration=duration,
+                            width=entry.get('width'),
+                            height=entry.get('height'),
+                            file_size=f_size
+                        ))
+
                     elif item_thumbs:
                         # Rasm element (oxirgi thumbnail eng yuqori sifatli hisoblanadi)
                         p_url = item_thumbs[-1].get('url')
@@ -324,11 +436,11 @@ class DownloaderService:
                     items=items
                 )
 
-            # 2. Yakka media (Single post)
+            # 2. Yakka media (Single post / Reel / Photo)
             formats = info.get('formats') or []
             thumbnails = info.get('thumbnails') or []
 
-            # Agar bu yakka rasm bo'lsa
+            # Agar bu yakka rasm bo'lsa (video formatlari yo'q)
             if not formats and thumbnails:
                 p_url = thumbnails[-1].get('url')
                 if p_url:
@@ -345,35 +457,30 @@ class DownloaderService:
                             file_size=p_path.stat().st_size
                         )
 
-            # Agar bu yakka video bo'lsa
+            # 3. Agar bu yakka video bo'lsa
             if formats:
-                best_format = max(
-                    formats,
-                    key=lambda f: (f.get('width') or 0) * (f.get('height') or 0)
-                )
-                v_url = best_format.get('url')
-                if v_url:
-                    v_path = self.download_dir / f"ig_video_{unique_id}.mp4"
-                    if self._download_http_file(v_url, v_path, referer="https://www.instagram.com/"):
-                        f_size = v_path.stat().st_size
-                        duration = info.get('duration')
-                        if f_size > MAX_FILE_SIZE_BYTES:
-                            c_path = self.download_dir / f"compressed_{unique_id}.mp4"
-                            if compress_video(v_path, c_path, target_size_mb=45, duration=duration):
-                                cleanup_file(v_path)
-                                v_path = c_path
-                                f_size = v_path.stat().st_size
-                        return DownloadResult(
-                            success=True,
-                            media_type="video",
-                            title=title,
-                            caption=caption,
-                            file_path=v_path,
-                            duration=duration,
-                            width=best_format.get('width'),
-                            height=best_format.get('height'),
-                            file_size=f_size
-                        )
+                duration = info.get('duration')
+                v_path = self._download_instagram_video(formats, unique_id, duration=duration)
+                if v_path and v_path.exists():
+                    f_size = v_path.stat().st_size
+                    if f_size > MAX_FILE_SIZE_BYTES:
+                        c_path = self.download_dir / f"compressed_{unique_id}.mp4"
+                        if compress_video(v_path, c_path, target_size_mb=44, duration=duration):
+                            cleanup_file(v_path)
+                            v_path = c_path
+                            f_size = v_path.stat().st_size
+
+                    return DownloadResult(
+                        success=True,
+                        media_type="video",
+                        title=title,
+                        caption=caption,
+                        file_path=v_path,
+                        duration=duration,
+                        width=info.get('width'),
+                        height=info.get('height'),
+                        file_size=f_size,
+                    )
 
             return None
 
@@ -496,12 +603,13 @@ class DownloaderService:
                 cleanup_file(dest_path)
                 return None
 
+            dest_path = ensure_telegram_compatible_audio(dest_path)
             file_size = dest_path.stat().st_size
             # 7. Agar hajm 50 MB dan katta bo'lsa, siqish
             if file_size > MAX_FILE_SIZE_BYTES:
                 logger.info("Bilibili video hajmi 50MB dan katta (%s), siqish boshlanmoqda...", format_size(file_size))
                 compressed_path = self.download_dir / f"compressed_{unique_id}.mp4"
-                compressed_ok = compress_video(dest_path, compressed_path, target_size_mb=45, duration=duration)
+                compressed_ok = compress_video(dest_path, compressed_path, target_size_mb=44, duration=duration)
                 if compressed_ok:
                     cleanup_file(dest_path)
                     dest_path = compressed_path
@@ -560,6 +668,9 @@ class DownloaderService:
                     if not file_path:
                         continue
 
+                    # Audio oqimini Telegram bilan 100% moslikka keltirish (Opus/Vorbis -> AAC)
+                    file_path = ensure_telegram_compatible_audio(file_path)
+
                     file_size = file_path.stat().st_size
                     duration = info.get('duration')
                     title = info.get('title') or "Video"
@@ -568,7 +679,7 @@ class DownloaderService:
                     if file_size > MAX_FILE_SIZE_BYTES:
                         logger.info("Video hajmi 50MB dan katta (%s), siqish boshlanmoqda...", format_size(file_size))
                         compressed_path = self.download_dir / f"compressed_{unique_id}.mp4"
-                        ok = compress_video(file_path, compressed_path, target_size_mb=45, duration=duration)
+                        ok = compress_video(file_path, compressed_path, target_size_mb=44, duration=duration)
                         if ok:
                             cleanup_file(file_path)
                             file_path = compressed_path
