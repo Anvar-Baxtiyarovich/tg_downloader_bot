@@ -1,5 +1,7 @@
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1
+
 # Kerakli tizim paketlari: ffmpeg va nodejs (YouTube JS challenge solver uchun)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
