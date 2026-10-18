@@ -9,18 +9,65 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
+from urllib.parse import urlparse
+
+# Qo'llab-quvvatlanadigan asosiy media platformalar domenlari
+SUPPORTED_MEDIA_DOMAINS = (
+    "instagram.com", "instagr.am",
+    "tiktok.com",
+    "youtube.com", "youtu.be",
+    "pinterest.com", "pin.it", "pinterest.co.uk",
+    "twitter.com", "x.com",
+    "facebook.com", "fb.watch", "fb.com",
+    "threads.net",
+    "reddit.com", "redd.it",
+    "bilibili.com", "b23.tv",
+    "snapchat.com",
+    "douyin.com", "kuaishou.com",
+    "likee.video", "likee.com",
+    "vk.com", "vkvideo.ru",
+    "vimeo.com",
+    "dailymotion.com", "dai.ly",
+)
+
 # URL regex
 URL_REGEX = re.compile(
     r'(https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[^\s]{2,}|'
     r'https?:\/\/(?:www\.|(?!www))[a-zA-Z0-9]+\.[^\s]{2,})'
 )
 
+
 def extract_url(text: str) -> Optional[str]:
-    """Matndan birinchi uchragan URL manzilini ajratib oladi."""
+    """Matndan birinchi uchragan URL manzilini ajratib oladi va chetdagi belgilarni tozalaydi."""
     if not text:
         return None
     match = URL_REGEX.search(text)
-    return match.group(0) if match else None
+    if not match:
+        return None
+    url = match.group(0)
+    # Oxiridagi ortiqcha tinish belgilarini (qavslar, nuqtalar, undovlar) tozalash
+    url = url.rstrip(".,;!?'\")>]} ")
+    return url
+
+
+def is_supported_media_url(url: str) -> bool:
+    """Havola qo'llab-quvvatlanadigan media platformasiga tegishli ekanligini tekshiradi."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower()
+        if not netloc and parsed.path:
+            netloc = parsed.path.split('/')[0].lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        netloc = netloc.split(":")[0]
+        for domain in SUPPORTED_MEDIA_DOMAINS:
+            if netloc == domain or netloc.endswith("." + domain):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def format_size(size_bytes: int) -> str:

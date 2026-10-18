@@ -668,15 +668,19 @@ class DownloaderService:
                     if not file_path:
                         continue
 
-                    # Audio oqimini Telegram bilan 100% moslikka keltirish (Opus/Vorbis -> AAC)
-                    file_path = ensure_telegram_compatible_audio(file_path)
+                    file_suffix = file_path.suffix.lower()
+                    is_image = file_suffix in ('.jpg', '.jpeg', '.png', '.webp')
+
+                    if not is_image:
+                        # Audio oqimini Telegram bilan 100% moslikka keltirish (Opus/Vorbis -> AAC)
+                        file_path = ensure_telegram_compatible_audio(file_path)
 
                     file_size = file_path.stat().st_size
                     duration = info.get('duration')
-                    title = info.get('title') or "Video"
+                    title = info.get('title') or ("Rasm" if is_image else "Video")
 
-                    # Hajmi 50 MB dan katta bo'lsa, avtomatik siqish
-                    if file_size > MAX_FILE_SIZE_BYTES:
+                    # Hajmi 50 MB dan katta bo'lsa, avtomatik siqish (faqat videolar uchun)
+                    if not is_image and file_size > MAX_FILE_SIZE_BYTES:
                         logger.info("Video hajmi 50MB dan katta (%s), siqish boshlanmoqda...", format_size(file_size))
                         compressed_path = self.download_dir / f"compressed_{unique_id}.mp4"
                         ok = compress_video(file_path, compressed_path, target_size_mb=44, duration=duration)
@@ -690,10 +694,11 @@ class DownloaderService:
                                 error_message=f"⚠️ Video hajmi juda katta ({format_size(file_size)}). Telegram cheklovi (50 MB) tufayli yuborib bo'lmadi."
                             )
 
-                    logger.info("Muvaffaqiyatli yuklandi (%s): %s [%s]", name, title, format_size(file_size))
+                    media_type = "photo" if is_image else "video"
+                    logger.info("Muvaffaqiyatli yuklandi (%s): %s [%s, type=%s]", name, title, format_size(file_size), media_type)
                     return DownloadResult(
                         success=True,
-                        media_type="video",
+                        media_type=media_type,
                         title=title,
                         caption=info.get('description') or title,
                         file_path=file_path,
